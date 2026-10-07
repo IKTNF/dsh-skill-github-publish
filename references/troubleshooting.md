@@ -191,6 +191,57 @@ foreach ($rel in @(git -C $tmp ls-files)) {
 }
 ```
 
+### 逐文件比对报「每个文件内容都不同」，但 HEAD 明明一致
+
+**现象**：推送成功、`rev-parse HEAD` 两边完全相同，可逐文件 `Get-FileHash` 比对时
+**所有**文件都报"内容不同"。同时 `git add` 阶段刷出一片警告：
+
+```
+warning: in the working copy of 'SKILL.md', LF will be replaced by CRLF the next time Git touches it
+```
+
+**原因**：`core.autocrlf=true`（Windows 上 Git for Windows 的默认值）。clone 出来的文本
+被检出为 CRLF，而刚写好的工作区文件是 LF —— **提交内容其实一模一样**，差的只是工作区字节。
+这是校验脚本的假阳性，仓库没有任何问题。
+
+确认一下：
+
+```powershell
+git config --show-origin --get-all core.autocrlf      # -> true
+# 提交内容是否真的一致：比对 HEAD 树里的 blob 哈希
+$a = @(git -C $RepoDir ls-tree -r HEAD)
+$b = @(git -C $tmp     ls-tree -r HEAD)
+($a -join "`n") -eq ($b -join "`n")                   # -> True，说明发布完全正确
+```
+
+**修复（两层）**：
+
+1. **校验层** —— 以 `ls-tree -r HEAD` 为主校验（比的是提交内容，跟工作区换行符无关）；
+   要做工作区比对就先归一化 `\r\n` → `\n`，并按前 8000 字节是否含 NUL 区分文本/二进制：
+
+```powershell
+function Get-TextNormalizedHash([string]$Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $bin = $false
+    foreach ($x in $bytes[0..([Math]::Min(7999,$bytes.Length-1))]) { if ($x -eq 0) { $bin = $true; break } }
+    $payload = if ($bin) { $bytes } else {
+        [Text.Encoding]::UTF8.GetBytes(([Text.Encoding]::UTF8.GetString($bytes)) -replace "`r`n","`n")
+    }
+    [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($payload)).Replace('-','')
+}
+```
+
+2. **根因层** —— 在仓库里放一个 `.gitattributes`，让检出结果确定：
+
+```
+* text=auto eol=lf
+```
+
+### `Test-Path : Illegal characters in path`（中文/特殊字符路径）
+
+用 `-c core.quotepath=false ls-files` 拿到真实路径，并用 `-LiteralPath`
+（中文名含 `.`、`[]` 等字符时 `-Path` 会当通配符解析）。
+
 ### 最省事的校验：比 commit SHA
 
 远端和本地 `git rev-parse HEAD` 相同 ⇒ 整棵树逐字节相同。

@@ -162,20 +162,45 @@ git clone -q --depth 1 https://github.com/<owner>/<repo>.git $tmp
 (git -C $tmp rev-parse HEAD) -eq (git -C $root rev-parse HEAD)
 ```
 
-Then compare per-file hashes by **relative path from `git ls-files`** — do not string-replace
-the path prefix, that comparison silently produces a full list of false "missing" rows:
+Then compare **committed content**, not working-tree bytes, via the HEAD trees:
 
 ```powershell
-foreach ($rel in @(git -C $tmp ls-files)) {
-  $rf = Join-Path $tmp  ($rel -replace '/','\')
-  $lf = Join-Path $root ($rel -replace '/','\')
-  if (-not (Test-Path -LiteralPath $lf)) { "仅远端: $rel" }
-  elseif ((Get-FileHash -LiteralPath $rf).Hash -ne (Get-FileHash -LiteralPath $lf).Hash) { "内容不同: $rel" }
+$a = @(git -C $root ls-tree -r HEAD)
+$b = @(git -C $tmp  ls-tree -r HEAD)
+($a -join "`n") -eq ($b -join "`n")     # identical ⇒ every blob hash matches
+```
+
+> **Do not compare raw working-tree hashes with `Get-FileHash` as the primary check.**
+> With `core.autocrlf=true` (the Windows default) a clone checks text files out as CRLF
+> while the freshly-written working tree is LF, so every file reports "content differs"
+> even though the push was perfect. That is a false positive, not a bad publish.
+> If you do want a working-tree comparison, normalise `\r\n` → `\n` first, and treat the
+> `ls-tree` result as authoritative.
+
+Normalised working-tree comparison, for catching uncommitted local drift:
+
+```powershell
+function Get-TextNormalizedHash([string]$Path) {
+  $bytes = [IO.File]::ReadAllBytes($Path)
+  $bin = $false
+  foreach ($x in $bytes[0..([Math]::Min(7999,$bytes.Length-1))]) { if ($x -eq 0) { $bin = $true; break } }
+  $payload = if ($bin) { $bytes } else {
+    [Text.Encoding]::UTF8.GetBytes(([Text.Encoding]::UTF8.GetString($bytes)) -replace "`r`n","`n")
+  }
+  [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($payload)).Replace('-','')
 }
 ```
 
-`git ls-files` quotes non-ASCII paths as octal escapes; pass `-c core.quotepath=false` to
-read them.
+Use **`-LiteralPath`** and relative paths from `git -c core.quotepath=false ls-files`;
+never strip a path prefix with `.Replace()` (that comparison silently yields a full list of
+false "missing" rows). `git ls-files` quotes non-ASCII paths as octal escapes unless
+`core.quotepath=false`.
+
+**Prevent the whole class of problem** by shipping a `.gitattributes`:
+
+```
+* text=auto eol=lf
+```
 
 Finally prove the secret did not leak:
 
@@ -196,6 +221,8 @@ git -C $root grep -l -I -E "gho_[A-Za-z0-9]{30,}" HEAD   # must be empty
 | `<>` substituted as `??` / parse error | `??` used inside string interpolation | build the string with `if/else` first |
 | `414 Request-URI Too Large` on a short path | `Invoke-WebRequest` reusing a broken keep-alive | use `curl.exe`, or the `contents`/`git trees` API instead |
 | `git ls-files` shows `"markdown/\345\205\250..."` | git quotes non-ASCII by default | `-c core.quotepath=false` |
+| clone reports **every** file "content differs" but HEAD matches | `core.autocrlf=true` rewrites LF→CRLF on checkout | compare `ls-tree -r HEAD`, not working-tree bytes; add `.gitattributes` with `* text=auto eol=lf` |
+| `git` prints `LF will be replaced by CRLF` on `add` | autocrlf on, no `.gitattributes` | ship `* text=auto eol=lf` in the repo |
 | `gh: command not found` | no GitHub CLI on this machine | this whole API-based flow |
 
 ## Reference

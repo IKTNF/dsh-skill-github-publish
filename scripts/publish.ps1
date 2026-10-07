@@ -206,6 +206,23 @@ function Push-Repo {
 # --------------------------------------------------------------------------
 # 5. 校验
 # --------------------------------------------------------------------------
+function Get-TextNormalizedHash {
+    <# 归一化换行符后求哈希。
+       core.autocrlf=true 时 clone 出来的文本是 CRLF，而刚写完的工作区文件是 LF，
+       直接比字节会把正确发布误判成"内容不同"。二进制文件退回原始字节哈希。 #>
+    param([string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $isBinary = $false
+    foreach ($b in $bytes[0..([Math]::Min(7999, $bytes.Length - 1))]) { if ($b -eq 0) { $isBinary = $true; break } }
+    if ($isBinary) { $payload = $bytes }
+    else {
+        $s = [Text.Encoding]::UTF8.GetString($bytes) -replace "`r`n", "`n"
+        $payload = [Text.Encoding]::UTF8.GetBytes($s)
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    return [BitConverter]::ToString($sha.ComputeHash($payload)).Replace('-', '')
+}
+
 function Test-Publication {
     param([string]$RepoDir, [string]$Owner, [string]$Name)
     $tmp = Join-Path $env:TEMP ("ghpub-verify-" + [guid]::NewGuid().ToString('N').Substring(0,8))
@@ -217,15 +234,35 @@ function Test-Publication {
     $lh = (git -C $RepoDir rev-parse HEAD).Trim()
     if ($rh -eq $lh) { Write-Ok "HEAD 一致 ($($lh.Substring(0,7)))" } else { Write-Err "HEAD 不一致: 远端 $rh / 本地 $lh" }
 
+    # 权威校验：比对 HEAD 树里的 blob 哈希（提交内容），完全不受工作区换行符影响
+    $la = @(git -C $RepoDir ls-tree -r HEAD)
+    $ra = @(git -C $tmp     ls-tree -r HEAD)
+    if (($la -join "`n") -eq ($ra -join "`n")) {
+        Write-Ok "$($la.Count)/$($la.Count) 个 blob 哈希一致（提交内容逐字节相同）"
+    } else {
+        $lset = @{}; $la | ForEach-Object { $p = ($_ -split "`t")[1]; if ($p) { $lset[$p] = $_ } }
+        $rset = @{}; $ra | ForEach-Object { $p = ($_ -split "`t")[1]; if ($p) { $rset[$p] = $_ } }
+        foreach ($k in $rset.Keys) { if (-not $lset.ContainsKey($k)) { Write-Err "仅远端有: $k" } elseif ($lset[$k] -ne $rset[$k]) { Write-Err "blob 不同: $k" } }
+        foreach ($k in $lset.Keys) { if (-not $rset.ContainsKey($k)) { Write-Err "仅本地有: $k" } }
+    }
+
+    # 附加校验：工作区字节（归一化换行符后），能抓出"提交了但工作区还有未提交改动"之类的问题
     $bad = 0; $n = 0
-    foreach ($rel in @(git -C $tmp ls-files)) {          # 注意：需 -c core.quotepath=false 才可读中文名
+    foreach ($rel in @(git -C $tmp -c core.quotepath=false ls-files)) {
         $n++
         $rf = Join-Path $tmp      ($rel -replace '/', '\')
         $lf = Join-Path $RepoDir  ($rel -replace '/', '\')
         if (-not (Test-Path -LiteralPath $lf)) { Write-Err "仅远端有: $rel"; $bad++ }
-        elseif ((Get-FileHash -LiteralPath $rf).Hash -ne (Get-FileHash -LiteralPath $lf).Hash) { Write-Err "内容不同: $rel"; $bad++ }
+        elseif ((Get-TextNormalizedHash $rf) -ne (Get-TextNormalizedHash $lf)) { Write-Err "工作区内容不同: $rel"; $bad++ }
     }
-    if ($bad -eq 0) { Write-Ok "$n/$n 个文件哈希一致" }
+    if ($bad -eq 0) { Write-Ok "$n/$n 个工作区文件一致（已归一化换行符）" }
+
+    # autocrlf 陷阱提醒
+    $acr = (git config --get core.autocrlf) 2>$null
+    if ($acr -and $acr.Trim() -eq 'true' -and -not (Test-Path (Join-Path $RepoDir '.gitattributes'))) {
+        Write-Warn2 "core.autocrlf=true 且仓库没有 .gitattributes —— clone 到别处时文本会变 CRLF，"
+        Write-Warn2 "  建议加一行：`* text=auto eol=lf"
+    }
 
     # 令牌泄露检查
     $cfg = Get-Content (Join-Path $RepoDir '.git\config') -Raw
