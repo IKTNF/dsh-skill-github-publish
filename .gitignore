@@ -1,0 +1,12 @@
+# 本 Skill 不需要依赖；这里只挡掉运行时杂物
+*.tmp
+*.log
+*.bak
+~$*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
